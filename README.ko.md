@@ -1,4 +1,8 @@
 # Azure Functions Python Cookbook
+> [!NOTE]
+> 이 문서는 [영어 원문](README.md)의 번역본으로 커뮤니티가 관리합니다.
+> 영어 원문이 업데이트된 뒤에는 내용이 다소 늦어질 수 있으며,
+> 단일 정보 원본(Single Source of Truth)은 영어 [README.md](README.md)입니다.
 
 [![Python Version](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/yeongseon/azure-functions-cookbook-python)
 [![CI](https://github.com/yeongseon/azure-functions-cookbook-python/actions/workflows/ci-smoke.yml/badge.svg)](https://github.com/yeongseon/azure-functions-cookbook-python/actions/workflows/ci-smoke.yml)
