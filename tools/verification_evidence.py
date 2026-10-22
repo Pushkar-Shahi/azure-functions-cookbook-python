@@ -14,6 +14,14 @@ import xml.etree.ElementTree as ET
 Status = Literal["PASS", "FAIL", "INCOMPLETE", "NOT_APPLICABLE"]
 
 
+def read_xml_root(path: Path) -> ET.Element:
+    """Parse a locally generated report, refusing entity declarations."""
+    data = path.read_bytes()
+    if b"<!ENTITY" in data.upper():
+        raise ValueError("XML reports must not declare entities")
+    return ET.fromstring(data)
+
+
 @dataclass(frozen=True, slots=True)
 class Counts:
     selected: int = 0
@@ -86,7 +94,7 @@ def environment() -> dict[str, str]:
 def collect(directory: Path, command: list[str], exit_code: int) -> Summary:
     cases: list[ET.Element] = []
     for path in directory.rglob("*junit*.xml"):
-        root = ET.parse(path).getroot()
+        root = read_xml_root(path)
         suites = list(root.iter("testsuite"))
         if not suites:
             raise ValueError("JUnit contains no testsuite")
