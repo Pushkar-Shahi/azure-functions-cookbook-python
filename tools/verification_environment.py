@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from importlib.util import find_spec
 import os
 from pathlib import Path
 import shutil
@@ -14,7 +15,7 @@ def doctor() -> int:
     print(f"hatch or venv: {'available' if managed else 'MISSING'} (required)")
     missing |= not managed
     for tool in ("ruff", "mypy", "pytest", "bandit"):
-        present = bool(shutil.which(tool))
+        present = bool(find_spec(tool)) and bool(shutil.which(tool))
         print(f"{tool}: {'available' if present else 'MISSING'} (required for check/test)")
         missing |= not present
     for tool, lanes in (
@@ -26,6 +27,8 @@ def doctor() -> int:
         print(f"{tool}: {'available' if shutil.which(tool) else 'MISSING'} (required for {lanes})")
     print(f"bicep: {'available' if bicep_command() else 'MISSING'} (required for bicep/verify)")
     print("doctor: " + ("INCOMPLETE" if missing else "PASS"))
+    if missing:
+        print("development environment not created: run make install")
     return 2 if missing else 0
 
 
@@ -63,6 +66,8 @@ def clean(root: Path) -> None:
     candidates.extend(root.glob("*.egg-info"))
     candidates.extend(root.rglob("__pycache__"))
     for candidate in candidates:
+        if candidate.is_symlink():
+            continue
         if any(
             part in {".git", ".venv", "venv", "env"} for part in candidate.relative_to(root).parts
         ):
@@ -73,7 +78,7 @@ def clean(root: Path) -> None:
                 path.unlink()
         if candidate.is_dir():
             for path in sorted(candidate.rglob("*"), reverse=True):
-                if path.is_dir() and not any(path.iterdir()):
+                if not path.is_symlink() and path.is_dir() and not any(path.iterdir()):
                     path.rmdir()
             if not any(candidate.iterdir()):
                 candidate.rmdir()
