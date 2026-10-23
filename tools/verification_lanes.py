@@ -55,6 +55,8 @@ def pytest_lane(lane: str, selection: list[str]) -> Summary:
         summary = Summary(
             lane, tuple(command), exit_code=130, reason="Interrupted; owned children stopped"
         )
+        finish(directory, summary)
+        raise
     return finish(directory, summary)
 
 

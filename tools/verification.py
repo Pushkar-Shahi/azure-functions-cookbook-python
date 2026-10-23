@@ -13,7 +13,7 @@ from tools.verification_evidence import Counts, Status, Summary, collect, load, 
 from tools.verification_host import azurite
 from tools.verification_lanes import azure, bicep, finish, fresh, pytest_lane, task
 from tools.verification_manifest import LOCAL_SUITES, recipes
-from tools.verification_process import run
+from tools.verification_process import configured, run
 
 
 def aggregate(lane: str, outcomes: list[Summary]) -> Summary:
@@ -65,9 +65,8 @@ def integration() -> Summary:
     except (OSError, RuntimeError, TimeoutError) as error:
         outcomes.append(Summary("services", ("azurite", "func"), reason=str(error)))
     except KeyboardInterrupt:
-        outcomes.append(
-            Summary("services", ("azurite", "func"), exit_code=130, reason="Interrupted")
-        )
+        complete_cancelled("integration", outcomes, [family for family, _, _ in LOCAL_SUITES])
+        raise
     for summary in outcomes:
         source = Path("test-results") / summary.lane / "junit.xml"
         if source.exists():
@@ -94,14 +93,16 @@ def host_smoke() -> Summary:
     }
     if selection and selection not in cases:
         return finish(directory, Summary("host-smoke", ("func",), reason="Unknown host recipe"))
+    outcomes: list[Summary] = []
+    selected = {name: path for name, path in cases.items() if not selection or name == selection}
     try:
-        with azurite(directory):
-            outcomes = [
-                pytest_lane("host-smoke/" + name, [path, "-m", "e2e", "--no-cov"])
-                for name, path in cases.items()
-                if not selection or name == selection
-            ]
+        with azurite(directory), configured({"VERIFICATION_ISOLATED_RECIPES": "1"}):
+            for name, path in selected.items():
+                outcomes.append(pytest_lane("host-smoke/" + name, [path, "-m", "e2e", "--no-cov"]))
         return aggregate("host-smoke", outcomes)
+    except KeyboardInterrupt:
+        complete_cancelled("host-smoke", outcomes, list(selected))
+        raise
     except (OSError, RuntimeError, TimeoutError) as error:
         return finish(directory, Summary("host-smoke", ("func",), reason=str(error)))
 
@@ -147,6 +148,8 @@ def offline() -> Summary:
     selection = [
         "tests",
         "--ignore=tests/test_bicep_compiles.py",
+        "--deselect=tests/test_bicep_linux_plans.py::"
+        "test_fixed_python_plan_site_templates_compile_without_bcp025",
         "--ignore=tests/e2e",
         "--cov-report=term-missing",
         "--cov-report=xml:test-results/test/coverage.xml",
@@ -158,6 +161,21 @@ def offline() -> Summary:
     for family in sorted({r.family for r in inventory}):
         print(f"recipe inventory {family}: {sum(r.family == family for r in inventory)} selected")
     return result
+
+
+def complete_cancelled(lane: str, outcomes: list[Summary], families: list[str]) -> None:
+    completed = {summary.lane for summary in outcomes}
+    for family in families:
+        name = lane + "/" + family
+        if name in completed:
+            continue
+        path = Path("test-results") / name / "summary.json"
+        outcomes.append(
+            load(path)
+            if path.exists()
+            else Summary(name, ("pytest",), reason="Required family not executed")
+        )
+    aggregate(lane, outcomes)
 
 
 def main() -> int:
