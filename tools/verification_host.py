@@ -13,9 +13,7 @@ import tempfile
 import time
 import uuid
 
-import requests
-
-from tools.verification_process import child, configured
+from tools.verification_process import child, configured, run
 
 ROOT = Path(__file__).resolve().parents[1]
 DEV_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
@@ -88,6 +86,8 @@ def azurite(directory: Path) -> Iterator[str]:
 
 @contextmanager
 def host(example: str, extra: Mapping[str, str] | None = None) -> Iterator[str]:
+    import requests
+
     number = port()
     connection = os.environ["AZURITE_CONNECTION_STRING"]
     values = {
@@ -115,7 +115,25 @@ def host(example: str, extra: Mapping[str, str] | None = None) -> Iterator[str]:
             Path(os.environ["VERIFICATION_LOG_DIR"])
             / f"{example.replace('/', '-')}-{uuid.uuid4().hex[:8]}.log"
         )
-        values["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]
+        interpreter = Path(sys.executable)
+        if os.environ.get("VERIFICATION_ISOLATED_RECIPES") == "1":
+            environment = Path(temporary) / "venv"
+            for command in (
+                [sys.executable, "-m", "venv", str(environment)],
+                [
+                    str(environment / "bin/python"),
+                    "-m",
+                    "pip",
+                    "install",
+                    "-r",
+                    str(project / "requirements.txt"),
+                ],
+            ):
+                if run(command, log.with_suffix(".install.log"), 300):
+                    raise RuntimeError(f"Recipe requirements installation failed for {example}")
+            interpreter = environment / "bin/python"
+            values["VIRTUAL_ENV"] = str(environment)
+        values["PATH"] = str(interpreter.parent) + os.pathsep + os.environ["PATH"]
         with (
             configured(values),
             child(
@@ -135,6 +153,6 @@ def host(example: str, extra: Mapping[str, str] | None = None) -> Iterator[str]:
                         print(f"Owned host pid={process.pid} port={number} recipe={example}")
                         yield base
                         return
-                except (requests.RequestException, ValueError):
+                except (requests.RequestException, ValueError, OSError):
                     time.sleep(0.2)
             raise TimeoutError(f"Host indexing/readiness timeout for {example}")

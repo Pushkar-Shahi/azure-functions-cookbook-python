@@ -6,6 +6,7 @@ RUN := $(HATCH) run python
 else
 RUN := $(PYTHON)
 endif
+MAINTENANCE_PYTHON = $(shell environment=$$($(HATCH) env find 2>/dev/null); if test -n "$$environment" && test -x "$$environment/bin/python"; then echo "$$environment/bin/python"; elif test -x "$$VIRTUAL_ENV/bin/python"; then echo "$$VIRTUAL_ENV/bin/python"; elif test -x .venv/bin/python; then echo .venv/bin/python; else command -v python3.11 || command -v python3; fi)
 
 .PHONY: bootstrap ensure-hatch install install-ci shell reset hatch-clean
 bootstrap ensure-hatch:
@@ -46,13 +47,13 @@ check:
 check-all: verify
 
 .PHONY: test integration verify report clean bicep worker-registration smoke
-test integration verify report clean bicep worker-registration smoke:
+test integration verify bicep worker-registration smoke:
 	@$(RUN) -m tools.verification $@
+report clean:
+	@$(MAINTENANCE_PYTHON) -m tools.verification $@
 .PHONY: doctor
 doctor:
-	@if [ -n "$$CI" ]; then $(PYTHON) -m tools.verification doctor; \
-	else environment=$$($(HATCH) env find) && test -x "$$environment/bin/python" && \
-	PATH="$$environment/bin:$$PATH" "$$environment/bin/python" -m tools.verification doctor; fi
+	@$(MAINTENANCE_PYTHON) -m tools.verification doctor
 
 .PHONY: recipe-tests
 recipe-tests:
