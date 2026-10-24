@@ -1,18 +1,18 @@
 VENV_DIR := .venv
-PYTHON := $(VENV_DIR)/bin/python
+# The interpreter you select: it builds the virtual environment and receives `make install-ci`.
+PYTHON ?= python3
 PIP := $(VENV_DIR)/bin/pip
 HATCH := $(VENV_DIR)/bin/hatch
 
+# POSIX sh helper: a tool counts only if `command -v` resolves it to an executable regular file.
+# dash's `command -v ./path` accepts any existing path, and `-x` alone is also true for a directory.
+HAVE := have() { p="$$(command -v "$$1")"; [ -f "$$p" ] && [ -x "$$p" ]; };
+
+# Idempotent: creates .venv and installs Hatch only while they are missing; never upgrades pip.
 .PHONY: bootstrap
 bootstrap:
-	@if [ ! -d "$(VENV_DIR)" ]; then \
-		echo "Creating virtual environment..."; \
-		python3 -m venv $(VENV_DIR); \
-	fi
-	@echo "Ensuring Hatch is installed in virtual environment..."
-	@$(PIP) install --upgrade pip > /dev/null
-	@$(PIP) install hatch > /dev/null
-	@echo "Hatch installed at $(HATCH)"
+	@test -d "$(VENV_DIR)" || { echo "Creating virtual environment..."; $(PYTHON) -m venv "$(VENV_DIR)"; }
+	@$(HAVE) have "$(HATCH)" || { echo "Installing Hatch..."; "$(PIP)" install --disable-pip-version-check --quiet hatch; }
 
 .PHONY: ensure-hatch
 ensure-hatch: bootstrap
@@ -25,6 +25,11 @@ install: ensure-hatch
 	else \
 		$(MAKE) precommit-install; \
 	fi
+
+# Installs into the selected interpreter (PYTHON), never into Hatch's default environment.
+.PHONY: install-ci
+install-ci:
+	@$(PYTHON) -m pip install -e ".[dev]"
 
 .PHONY: shell
 shell: ensure-hatch
@@ -95,11 +100,9 @@ recipe-tests: ensure-hatch
 docs-strict: ensure-hatch
 	@$(HATCH) run mkdocs build --strict
 
+# `lint` already runs the type check (hatch script `lint` = style + typecheck), so mypy runs once.
 .PHONY: check
-check: ensure-hatch
-	@$(MAKE) lint
-	@$(MAKE) lint-workflows
-	@$(MAKE) typecheck
+check: lint lint-workflows
 	@echo "Lint and type check passed."
 
 .PHONY: check-all
