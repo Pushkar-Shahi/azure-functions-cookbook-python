@@ -150,6 +150,124 @@ def test_install_ci_installs_into_the_selected_interpreter_and_not_through_hatch
     )
 
 
+def test_doctor_plan_runs_no_installer_bootstrap_or_test() -> None:
+    """Offline: `doctor` has no prerequisite, so its plan cannot install anything or run a test."""
+    plan = _plan("doctor")
+
+    for forbidden in ("pip", "hatch run", "pytest", "-m venv"):
+        assert forbidden not in plan
+
+
+def test_doctor_passes_when_every_required_tool_is_present(project: Project) -> None:
+    """Offline: `make doctor` lists each tool as ok and exits 0 (python >= 3.11 included)."""
+    result = project.make("doctor")
+
+    assert result.returncode == 0, result.stdout
+    assert _missing(result) == []
+    assert result.stdout.splitlines()[-1] == "doctor: ok"
+
+
+@pytest.mark.parametrize("tool", PATH_TOOLS)
+def test_doctor_names_a_missing_tool_and_exits_non_zero(project: Project, tool: str) -> None:
+    """Offline: one absent PATH tool is named, every other tool stays ok, the exit is non-zero."""
+    (project.tools / tool).unlink()
+
+    result = project.make("doctor")
+
+    assert result.returncode != 0
+    assert _missing(result) == [tool]
+    assert "doctor: INCOMPLETE" in result.stdout
+
+
+@pytest.mark.parametrize("hatch", ["missing", "directory"])
+def test_doctor_names_hatch_when_it_is_not_an_executable_file(project: Project, hatch: str) -> None:
+    """Offline: an absent Hatch, or a directory at its path, is reported as MISSING."""
+    path = project.root / ".venv/bin/hatch"
+    path.unlink()
+    if hatch == "directory":
+        path.mkdir()
+
+    result = project.make("doctor")
+
+    assert result.returncode != 0
+    assert _missing(result) == [".venv/bin/hatch"]
+
+
+@pytest.mark.parametrize(
+    ("version", "supported"),
+    [("(3, 10, 12)", False), ("(3, 11, 0)", True), ("(3, 14, 4)", True)],
+    ids=["3.10", "3.11", "3.14"],
+)
+def test_doctor_requires_python_3_11_or_newer(
+    project: Project, tmp_path: Path, version: str, supported: bool
+) -> None:
+    """Offline: the selected interpreter is accepted from 3.11 and rejected below it."""
+    python = tmp_path / "python"
+    python.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" -c "import sys; sys.version_info = {version}; $2"\n'
+    )
+    python.chmod(0o755)
+
+    result = project.make("doctor", PYTHON=str(python))
+
+    assert (result.returncode == 0) is supported
+    assert [line.split(" (")[0] for line in _missing(result)] == (
+        [] if supported else ["python >= 3.11"]
+    )
+
+
+def test_doctor_names_python_when_the_selected_interpreter_is_absent(
+    project: Project, tmp_path: Path
+) -> None:
+    """Offline: a PYTHON that does not exist is reported, with the way to select another."""
+    result = project.make("doctor", PYTHON=str(tmp_path / "nowhere/python"))
+
+    assert result.returncode != 0
+    assert [line.split(" (")[0] for line in _missing(result)] == ["python >= 3.11"]
+    assert "PYTHON=python3.11" in result.stdout
+
+
+def test_doctor_looks_for_bicep_where_the_compile_tool_does(
+    project: Project, tmp_path: Path
+) -> None:
+    """Offline: BICEP_CLI replaces the PATH lookup, so a bogus value is named as missing."""
+    (project.tools / "bicep").unlink()
+    cli = _stub(tmp_path / "elsewhere/bicep", "bicep", project.log)
+
+    assert project.make("doctor", BICEP_CLI=str(cli)).returncode == 0
+    bogus = project.make("doctor", BICEP_CLI=str(tmp_path / "nowhere/bicep"))
+    assert bogus.returncode != 0
+    assert _missing(bogus) == [str(tmp_path / "nowhere/bicep")]
+
+
+def test_doctor_with_nothing_installed_names_every_tool_and_changes_nothing(tmp_path: Path) -> None:
+    """Offline: an empty PATH and no .venv name all seven requirements and create nothing."""
+    bare, empty = tmp_path / "bare", tmp_path / "empty"
+    bare.mkdir()
+    empty.mkdir()
+    shutil.copy(REPO_ROOT / "Makefile", bare / "Makefile")
+
+    result = subprocess.run(
+        [MAKE, "-C", str(bare), "--no-print-directory", "doctor"],
+        env={"PATH": str(empty)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert [name.split(" (")[0] for name in _missing(result)] == [
+        "python >= 3.11",
+        ".venv/bin/hatch",
+        "uv",
+        "git",
+        "func",
+        "azurite",
+        "bicep",
+    ]
+    assert [path.name for path in bare.iterdir()] == ["Makefile"]
+
+
 def test_routine_targets_never_call_pip_while_hatch_is_present(project: Project) -> None:
     """Offline: repeated runs neither install nor upgrade anything."""
     for _ in range(3):
@@ -225,16 +343,3 @@ def test_clean_removes_links_without_following_them(
     assert result.returncode == 0, result.stderr
     assert (outside / "keep.txt").read_text() == "keep"
     assert not [name for name in links if os.path.lexists(project.root / name)]
-
-
-def test_doctor_recipe_preserves_failed_check_status() -> None:
-    recipe = next(
-        line.strip().removeprefix("@").replace("$(MAKE) check-all", "false")
-        for line in Path("Makefile").read_text().splitlines()
-        if "Some checks failed." in line
-    )
-
-    result = subprocess.run(["sh", "-c", recipe], check=False, capture_output=True, text=True)
-
-    assert result.returncode != 0
-    assert "Some checks failed." in result.stdout

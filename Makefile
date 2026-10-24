@@ -1,5 +1,6 @@
 VENV_DIR := .venv
-# The interpreter you select: it builds the virtual environment and receives `make install-ci`.
+# The interpreter you select: it builds the virtual environment, `make doctor` checks it and
+# `make install-ci` installs into it.
 PYTHON ?= python3
 PIP := $(VENV_DIR)/bin/pip
 HATCH := $(VENV_DIR)/bin/hatch
@@ -188,7 +189,18 @@ help:
 	@echo "Available commands:" && \
 	grep -E '^\.PHONY: ' Makefile | cut -d ':' -f2 | xargs -n1 echo "  - make"
 
+# What `make verify` needs, checked read-only: no prerequisites, so it never installs anything,
+# creates .venv or runs a test. (The product CLI is `azure-functions-doctor`, not this target.)
+# Bicep is looked up the way tools/compile_bicep_templates.py does: BICEP_CLI, else PATH.
 .PHONY: doctor
-doctor: ensure-hatch
-	@echo "Checking project health..."
-	@$(MAKE) check-all && echo "All checks passed." || { echo "Some checks failed."; exit 1; }
+doctor:
+	@missing=0; $(HAVE) \
+	if "$(PYTHON)" -c 'import sys; sys.exit(sys.version_info < (3, 11))' > /dev/null 2>&1; then \
+		echo "ok       $(PYTHON) (python >= 3.11)"; \
+	else echo "MISSING  python >= 3.11 ($(PYTHON) is missing or older; select one with PYTHON=python3.11)"; missing=1; fi; \
+	for tool in "$(HATCH)" uv git func azurite "$${BICEP_CLI:-bicep}"; do \
+		if have "$$tool"; then echo "ok       $$tool"; \
+		else echo "MISSING  $$tool"; missing=1; fi; \
+	done; \
+	[ $$missing -eq 0 ] || { echo "doctor: INCOMPLETE - make verify needs the MISSING tools above (Hatch: run make install)"; exit 1; }; \
+	echo "doctor: ok"
