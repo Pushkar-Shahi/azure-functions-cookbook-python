@@ -126,6 +126,37 @@ test: ensure-hatch
 	@echo "Running tests..."
 	@$(HATCH) run test
 
+# Full local verification. A required lane fails on a skipped or xfailed test
+# (tools/pytest_fail_on_skip.py) and pytest exits 5 when a lane selects nothing. PYTEST_ADDOPTS is
+# set, not appended to, so a stray value in the caller's environment cannot deselect tests.
+FAIL_ON_SKIP := -p tools.pytest_fail_on_skip
+
+# Emulator lanes: the e2e fixtures start Azurite and `func start` themselves (tests/e2e/conftest.py).
+.PHONY: integration
+integration: ensure-hatch
+	@$(HAVE) missing=""; for tool in func azurite; do have "$$tool" || missing="$$missing $$tool"; done; \
+	[ -z "$$missing" ] || { echo "integration: missing required tool(s):$$missing (see make doctor)"; exit 2; }
+	@PYTEST_ADDOPTS="$(FAIL_ON_SKIP)" $(HATCH) run smoke
+	@PYTEST_ADDOPTS="$(FAIL_ON_SKIP)" $(HATCH) run e2e
+
+.PHONY: bicep
+bicep: ensure-hatch
+	@$(HATCH) run python tools/compile_bicep_templates.py
+
+# Needs network (it clones the pinned worker) and the worker's runtime requirements, which live in
+# the `worker` Hatch environment (pyproject.toml) rather than in the recipes' dev extras.
+.PHONY: worker-registration
+worker-registration: ensure-hatch
+	@PYTEST_ADDOPTS="$(FAIL_ON_SKIP)" $(HATCH) run worker:registration
+
+# Each part runs once and the first failure stops the run. Serial even under `make -j`: the lanes
+# share Azurite's fixed ports and the Hatch environments. `check-all` is the narrower everyday gate
+# and keeps its meaning.
+.NOTPARALLEL: verify
+.PHONY: verify
+verify: check test recipe-tests bicep worker-registration integration build docs-strict
+	@echo "Full local verification passed."
+
 .PHONY: new-recipe
 new-recipe: ensure-hatch
 ifndef CAT

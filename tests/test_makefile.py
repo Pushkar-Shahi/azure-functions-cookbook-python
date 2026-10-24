@@ -17,10 +17,21 @@ import sys
 import tomllib
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAKE = shutil.which("make") or "make"
+FAIL_ON_SKIP = "-p tools.pytest_fail_on_skip"
 PATH_TOOLS = ("uv", "git", "func", "azurite", "bicep")
+VERIFY_ONLY_LANES = (
+    "scripts/run_recipe_tests.py",
+    "tools/compile_bicep_templates.py",
+    "-m worker_registration",
+    "-m smoke",
+    "-m e2e",
+    "hatch build",
+    "mkdocs build",
+)
 
 
 def _hatch_scripts(env: str) -> dict[str, str]:
@@ -136,10 +147,50 @@ def test_check_runs_every_check_exactly_once() -> None:
     assert plan.count("tools/lint_hatch_matrix.py") == 1
 
 
-@pytest.mark.parametrize("target", ["test", "check", "check-all"])
+@pytest.mark.parametrize("target", ["test", "check", "check-all", "verify", "integration", "bicep"])
 def test_no_routine_target_upgrades_pip(target: str) -> None:
     """Offline: no plan upgrades pip; Hatch is only installed while it is missing."""
     assert "--upgrade" not in _plan(target)
+
+
+def test_check_all_keeps_its_meaning() -> None:
+    """Offline: `make check-all` stays lint, types, tests and security, without verify's lanes."""
+    plan = _expand(_plan("check-all"))
+
+    for part in (
+        "mypy src tests",
+        "tools/lint_hatch_matrix.py",
+        "pytest -v tests",
+        "bandit -r src",
+    ):
+        assert part in plan
+    assert not [lane for lane in VERIFY_ONLY_LANES if lane in plan]
+
+
+def test_verify_runs_each_lane_once_in_dependency_order() -> None:
+    """Offline: verify is check, test, recipe suites, Bicep, worker, emulators, build, docs."""
+    plan = _expand(_plan("verify"))
+    lanes = [
+        "mypy src tests",
+        "tools/lint_hatch_matrix.py",
+        "pytest -v tests",
+        *VERIFY_ONLY_LANES[:2],
+        "-m worker_registration",
+        "-m smoke tests/e2e/",
+        "-m e2e tests/e2e/",
+        "hatch build",
+        "mkdocs build --strict",
+    ]
+
+    assert [plan.count(lane) for lane in lanes] == [1] * len(lanes)
+    positions = [plan.index(lane) for lane in lanes]
+    assert positions == sorted(positions)
+
+
+@pytest.mark.parametrize(("target", "lanes"), [("integration", 2), ("worker-registration", 1)])
+def test_emulator_and_worker_lanes_fail_on_skips(target: str, lanes: int) -> None:
+    """Offline: every pytest lane of these targets loads the fail-on-skip plugin."""
+    assert _plan(target).count(f'PYTEST_ADDOPTS="{FAIL_ON_SKIP}"') == lanes
 
 
 def test_install_ci_installs_into_the_selected_interpreter_and_not_through_hatch() -> None:
@@ -323,6 +374,61 @@ def test_missing_virtual_environment_is_built_by_the_selected_interpreter(
     assert second.stdout == ""
 
 
+@pytest.mark.parametrize("missing", [["func"], ["azurite"], ["func", "azurite"]])
+def test_integration_fails_before_any_lane_when_an_emulator_tool_is_missing(
+    project: Project, missing: list[str]
+) -> None:
+    """Offline: a missing `func` or `azurite` is named and no test lane starts."""
+    for tool in missing:
+        (project.tools / tool).unlink()
+
+    result = project.make("integration")
+
+    assert result.returncode != 0
+    assert f"missing required tool(s): {' '.join(missing)} " in result.stdout
+    assert project.calls("hatch") == []
+
+
+def test_integration_runs_smoke_then_e2e_with_only_the_fail_on_skip_plugin(
+    project: Project,
+) -> None:
+    """Offline: both lanes run in order and replace a stray PYTEST_ADDOPTS rather than extend it."""
+    result = project.make("integration", PYTEST_ADDOPTS="-k nothing")
+
+    assert result.returncode == 0
+    assert [row for row in project.rows() if row[0] == "hatch"] == [
+        ("hatch", "run smoke", FAIL_ON_SKIP),
+        ("hatch", "run e2e", FAIL_ON_SKIP),
+    ]
+
+
+def test_a_failing_smoke_lane_stops_integration_before_e2e(project: Project) -> None:
+    """Offline: the first failing lane fails the target and later lanes never start."""
+    result = project.make("integration", STUB_FAIL="run smoke")
+
+    assert result.returncode != 0
+    assert project.calls("hatch") == ["run smoke"]
+
+
+def test_verify_stops_at_the_first_failing_part(project: Project) -> None:
+    """Offline: a failing test run keeps every later part from running and fails `make verify`."""
+    result = project.make("verify", STUB_FAIL="run test")
+
+    assert result.returncode != 0
+    assert project.calls("hatch")[-1] == "run test"
+    assert "Full local verification passed." not in result.stdout
+
+
+def test_verify_stays_serial_under_make_jobs(project: Project) -> None:
+    """Offline: `make -j4 verify` never overlaps two parts (they share ports and environments)."""
+    result = project.make("-j4", "verify", STUB_SLEEP="0.05")
+
+    assert result.returncode == 0
+    tools = [tool for tool, _, _ in project.rows()]
+    assert tools == ["hatch", "end"] * (len(tools) // 2)
+    assert len(project.calls("hatch")) == 10
+
+
 @pytest.mark.parametrize("target", ["clean", "clean-all"])
 def test_clean_removes_links_without_following_them(
     project: Project, tmp_path: Path, target: str
@@ -343,3 +449,20 @@ def test_clean_removes_links_without_following_them(
     assert result.returncode == 0, result.stderr
     assert (outside / "keep.txt").read_text() == "keep"
     assert not [name for name in links if os.path.lexists(project.root / name)]
+
+
+def test_worker_environment_matches_the_scheduled_guard_job() -> None:
+    """Offline: the Hatch `worker` env pins and pytest command equal the scheduled job's."""
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    env = pyproject["tool"]["hatch"]["envs"]["worker"]
+    workflow = yaml.safe_load(
+        (REPO_ROOT / ".github/workflows/scheduled-trigger-smoke.yml").read_text(encoding="utf-8")
+    )
+    steps = workflow["jobs"]["worker-registration-guard"]["steps"]
+    install = next(step["run"] for step in steps if "pip install -e" in step.get("run", ""))
+    guard = next(
+        step["run"] for step in steps if "test_worker_registration_guard" in step.get("run", "")
+    )
+
+    assert set(env["extra-dependencies"]) == set(re.findall(r'"([\w.-]+~=[\d.]+)"', install))
+    assert env["scripts"]["registration"] == guard.removeprefix("python -m ")

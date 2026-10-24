@@ -122,6 +122,17 @@ precommit = "pre-commit run --all-files"
 precommit-install = "pre-commit install"
 security = "python -m bandit -r src"
 
+# The pinned Python worker's runtime requirements (workers/pyproject.toml at WORKER_SHA in
+# tests/test_worker_registration_guard.py, for Python <= 3.13). They are not recipe dependencies and
+# have no wheels for every supported Python, so they stay out of the `dev` extra. The scheduled
+# workflow installs the same pins; `make worker-registration` runs the guard in this environment.
+[tool.hatch.envs.worker]
+features = ["dev"]
+extra-dependencies = ["grpcio~=1.70.0", "protobuf~=5.29.0", "python-dateutil~=2.9.0"]
+
+[tool.hatch.envs.worker.scripts]
+registration = "pytest -v -m worker_registration --no-cov tests/test_worker_registration_guard.py"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
