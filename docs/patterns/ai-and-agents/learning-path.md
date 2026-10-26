@@ -6,14 +6,14 @@ This guided path traces the progression of building AI assistants and autonomous
 
 ## Architectural Progression
 
-Rather than treating AI applications as generic web servers or building monolithic showcases, compose focused, production-proven patterns across seven distinct stages:
+Rather than treating AI applications as generic web servers or building monolithic showcases, compose focused architectural patterns across seven distinct stages:
 
 ```mermaid
 flowchart TD
     S1["1. Direct Chat<br><i>HTTP Trigger</i><br>Single-turn completion"]
     --> S2["2. LangGraph Agent<br><i>LangGraphApp Route</i><br>Multi-step tool routing"]
     --> S3["3. Persistent Memory<br><i>Blob Checkpoints</i><br>Restart-safe conversations"]
-    --> S4["4. Grounded RAG<br><i>Azure AI Search</i><br>Vector + semantic retrieval"]
+    --> S4["4. Grounded RAG<br><i>Azure AI Search</i><br>Vector + filtered retrieval"]
     --> S5["5. Event-Driven Agent<br><i>Service Bus Trigger</i><br>Asynchronous decoupling"]
     --> S6["6. Durable Workflow<br><i>Durable Functions</i><br>Human approval & timeout"]
     --> S7["7. Production Hardening<br><i>APIM + Managed ID</i><br>Edge security & tracing"]
@@ -35,7 +35,7 @@ flowchart TD
 
 * **Trigger**: HTTP (`@app.route`)
 * **Underlying Service**: Azure OpenAI Service (`chat/completions`)
-* **When appropriate**: Low-latency single-turn prompts, text summarization, or classification where the client waits interactively and responses return in under 5 seconds.
+* **When appropriate**: Low-latency single-turn prompts, text summarization, or classification where the client waits interactively for a bounded request-response completion.
 * **Execution shape**:
   ```python
   @app.route(route="chat", methods=["POST"])
@@ -47,10 +47,10 @@ flowchart TD
 * **Required for capability**: Azure OpenAI Python client, HTTP trigger.
 * **Production upgrades**:
   - Use `DefaultAzureCredential` with Managed Identity instead of static API keys.
-  - Stream tokens via Server-Sent Events (SSE) to lower time-to-first-token (TTFT).
+  - Token streaming over Server-Sent Events (SSE) to reduce perceived time-to-first-token (TTFT). Note that the cookbook recipe (`streaming_ai_response`) implements **buffered SSE**; true token-by-token streaming depends on hosting plan HTTP streaming support and gateway/proxy buffering constraints.
 * **Reference recipes**:
   - [Azure OpenAI Direct Chat](openai-direct-chat.md) — clean client baseline.
-  - [Streaming AI Response](streaming-ai-response.md) — chunked token streaming.
+  - [Streaming AI Response](streaming-ai-response.md) — buffered SSE streaming.
 
 ---
 
@@ -73,14 +73,18 @@ flowchart TD
 
 * **Trigger**: HTTP (`LangGraphApp`) + Azure Blob Storage
 * **Underlying Service**: Azure Blob Storage Container (`checkpoints`)
-* **When appropriate**: Multi-turn conversational assistants where users refer to previous context across sessions, surviving Function App restarts and cold starts.
+* **When appropriate**: Multi-turn conversational assistants where users refer to previous context across sessions, surviving Function App cold starts and worker process recycles.
 * **State distinction**:
   - *In-Memory Saver*: Fast, zero-dependency local dev; checkpoints are lost when the function worker process recycles.
-  - *Blob Checkpointer*: Durable state stored as blobs keyed by `thread_id`; survives horizontal scaling and worker restarts.
-* **Security boundary (Critical)**:
+  - *Blob Checkpointer*: Durable state stored as blobs keyed by `thread_id`; survives cold starts and instance recycles.
+* **Concurrency & locking limitations (Critical)**:
   > [!WARNING]
+  > **Concurrent-Writer Hazard**: Azure Blob Storage checkpointers do not enforce distributed multi-instance write locking or optimistic concurrency out of the box. If multiple worker instances concurrently execute turns for the *same* `thread_id`, writes can race and overwrite checkpoint state (last-write-wins).
+  > To serialize execution per thread in distributed environments, route concurrent requests through a single-writer queue (such as Service Bus Sessions keyed by `session_id`), or implement blob lease locking.
+* **Identity boundary (Critical)**:
+  > [!IMPORTANT]
   > A `thread_id` is an execution state partition key at `config.configurable.thread_id`. **It is not an authenticated user identity or security boundary.**
-  > Never allow clients to supply an arbitrary `thread_id` without verifying that the authenticated caller owns that conversation thread. Always enforce caller identity before invoking the graph.
+  > Never allow clients to supply an arbitrary `thread_id` without verifying that the authenticated caller owns that conversation thread. Always authenticate the caller (via EasyAuth or bearer token) before invoking the graph.
 * **Required for capability**: Azure Blob Storage container, checkpointer package.
 * **Production upgrades**: Use identity-based storage connections (`AzureWebJobsStorage__blobServiceUri`) and configure blob lifecycle policies to expire stale threads.
 * **Reference recipe**:
@@ -95,9 +99,9 @@ flowchart TD
 * **When appropriate**: Answering questions against private internal documents, manuals, or catalogs without fine-tuning models.
 * **Architecture flow**:
   1. Input query is converted to a vector embedding using `text-embedding-3-small`.
-  2. Query is submitted to Azure AI Search for hybrid vector + semantic BM25 retrieval.
+  2. Query is submitted to Azure AI Search for vector and filtered search retrieval.
   3. Top matching passages are injected into the agent's prompt context.
-* **Why use the SDK instead of a binding**: Azure AI Search lacks a native Python v2 binding; calling `azure.search.documents` via the official SDK provides full access to vector query filters, semantic rerankers, and score thresholds.
+* **Why use the Azure SDK**: Querying Azure AI Search via the official `azure-search-documents` Python SDK provides direct control over vector queries, score thresholds, and metadata filters within the function execution context.
 * **Required for capability**: Azure AI Search index, embedding model deployment.
 * **Production upgrades**: Limit retrieved chunk count and payload size to avoid blowing model context windows; sanitize document metadata to prevent prompt injection.
 * **Reference recipes**:
@@ -112,22 +116,21 @@ flowchart TD
 * **Trigger**: Service Bus Queue or Topic Trigger (`@app.service_bus_queue_trigger`)
 * **Underlying Service**: Azure Service Bus
 * **When appropriate**:
-  - Agent execution takes longer than 15–20 seconds (e.g. multi-step tool loops or web searches).
-  - Upstream webhooks or backend events trigger agent tasks asynchronously.
-  - Requests must not fail due to transient HTTP connection timeouts or gateway limits.
+  - Long-running or variable-latency agent tasks (e.g. multi-step tool loops or web searches) that risk HTTP client or gateway timeouts.
+  - Upstream webhooks, system alerts, or asynchronous events trigger agent work.
+  - Decoupling requests with durable delivery, automatic retries, and dead-letter queue (DLQ) isolation for poison messages.
 * **Execution shape**:
   1. Client sends a request to an HTTP ingest endpoint; endpoint validates and enqueues a work message onto Service Bus, immediately returning `202 Accepted` with a correlation ID.
   2. A Service Bus-triggered function consumes the message, invokes the compiled LangGraph agent, and writes results to a database or notifies a webhook.
 * **Why this model fits**:
   - Prevents caller timeouts while preserving at-least-once processing guarantees.
   - Provides automatic retry and dead-letter queue (DLQ) isolation for poison inputs.
-  - Service Bus Sessions (`is_sessions_enabled=True`) can enforce strict FIFO ordering per `session_id` (e.g., ensuring messages for the same user or ticket process sequentially).
+  - Service Bus Sessions (`is_sessions_enabled=True`) can enforce strict FIFO ordering per `session_id` (e.g., ensuring messages for the same user or ticket process sequentially and serializing checkpoint access).
+* **Implementation boundary (Standalone vs. Proposed Composition)**:
+  - *Shipped Standalone Recipes*: The cookbook provides working standalone messaging recipes demonstrating reliable consumer workers ([Service Bus Worker](../messaging-and-pubsub/servicebus-worker.md)), ordered FIFO processing ([Service Bus Sessions](../messaging-and-pubsub/servicebus-sessions.md)), and error triage ([Service Bus DLQ Replay](../messaging-and-pubsub/servicebus-dlq-replay.md)).
+  - *Proposed Agent Composition*: Integrating a compiled LangGraph agent directly with a Service Bus queue trigger is an architectural composition tracked under upcoming issue [#349](https://github.com/yeongseon/azure-functions-cookbook-python/issues/349).
 * **Required for capability**: Service Bus namespace, Queue/Topic trigger handler.
 * **Production upgrades**: Configure `maxDeliveryCount` and monitor dead-letter queues; ensure agent tool side effects are idempotent.
-* **Reference recipes**:
-  - [Service Bus Worker](../messaging-and-pubsub/servicebus-worker.md) — reliable queue processing.
-  - [Service Bus Sessions](../messaging-and-pubsub/servicebus-sessions.md) — ordered per-session execution.
-  - [Service Bus DLQ Replay](../messaging-and-pubsub/servicebus-dlq-replay.md) — dead-letter message triage.
 
 ---
 
@@ -160,11 +163,10 @@ flowchart TD
                      │
                      └─► Activity: Execute Final Tool Action & Publish
   ```
+* **Implementation boundary (Standalone vs. Proposed Composition)**:
+  - *Shipped Standalone Recipes*: The cookbook provides working standalone Durable patterns demonstrating multi-activity orchestration ([Durable AI Pipeline](durable-ai-pipeline.md)), human approval events ([Durable Human Interaction](../orchestration-and-workflows/durable-human-interaction.md)), and async status queries ([Async Job Lifecycle](../orchestration-and-workflows/async-job-lifecycle.md)).
+  - *Proposed Agent Composition*: Composing compiled LangGraph agent activities with external human-approval events and compensation logic is an architectural composition tracked under upcoming issue [#350](https://github.com/yeongseon/azure-functions-cookbook-python/issues/350).
 * **Required for capability**: `azure-functions-durable`, Durable Task Hub.
-* **Reference recipes**:
-  - [Durable AI Pipeline](durable-ai-pipeline.md) — multi-activity LLM orchestration.
-  - [Durable Human Interaction](../orchestration-and-workflows/durable-human-interaction.md) — human approval pattern.
-  - [Async Job Lifecycle](../orchestration-and-workflows/async-job-lifecycle.md) — status query and lifecycle management.
 
 ---
 
@@ -202,11 +204,11 @@ Layer enterprise operational controls onto the working agent app:
 | Current Stage | Move to Next Stage When... | Next Trigger / Model |
 | --- | --- | --- |
 | **1. Direct Chat** | You need multi-step reasoning, external tool execution, or dynamic branching. | `LangGraphApp` route ([Stage 2](#stage-2-graph-driven-routing-tools-langgraphapp)) |
-| **2. LangGraph Agent** | Conversations span multiple turns and must survive worker restarts or scaling. | Blob checkpointer ([Stage 3](#stage-3-per-thread-memory-persistent-blob-checkpoints)) |
+| **2. LangGraph Agent** | Conversations span multiple turns and must survive worker restarts or cold starts. | Blob checkpointer ([Stage 3](#stage-3-per-thread-memory-persistent-blob-checkpoints)) |
 | **3. Memory / Checkpoints** | The agent requires external corporate knowledge, manuals, or document search. | Azure AI Search RAG ([Stage 4](#stage-4-grounded-knowledge-retrieval-azure-ai-search-rag)) |
-| **4. Grounded RAG** | Agent execution exceeds 15s or requests originate from asynchronous events. | Service Bus queue ([Stage 5](#stage-5-event-driven-agent-invocation-service-bus-decoupling)) |
-| **5. Event-Driven Agent** | Operations require human sign-off, multi-day waits, or complex compensation logic. | Durable Functions ([Stage 6](#stage-6-long-running-workflows-human-approval-durable-functions)) |
-| **6. Durable Workflows** | Moving into production multi-tenant environments with strict compliance. | Production hardening ([Stage 7](#stage-7-production-hardening-edge-identity-observability)) |
+| **4. Grounded RAG** | Execution duration threatens HTTP client/gateway timeouts, or requests originate from asynchronous events requiring at-least-once retry delivery. | Service Bus queue ([Stage 5](#stage-5-event-driven-agent-invocation-service-bus-decoupling)) |
+| **5. Event-Driven Agent** | Operations require human sign-off, multi-day wait intervals, durable timers, or compensation workflows. | Durable Functions ([Stage 6](#stage-6-long-running-workflows-human-approval-durable-functions)) |
+| **6. Durable Workflows** | Moving into production multi-tenant environments with strict compliance and security requirements. | Production hardening ([Stage 7](#stage-7-production-hardening-edge-identity-observability)) |
 
 ---
 

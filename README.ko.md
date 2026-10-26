@@ -308,6 +308,7 @@ PR을 열기 전에 변경한 Python 파일에 `ruff format --check <변경한-P
 - 제품 요구사항: `PRD.md`
 - 설계 원칙: `DESIGN.md`
 - 기여 가이드: `CONTRIBUTING.md`
+- AI 및 에이전트 학습 경로: [`docs/patterns/ai-and-agents/learning-path.md`](docs/patterns/ai-and-agents/learning-path.md)
 
 ## Ecosystem
 
