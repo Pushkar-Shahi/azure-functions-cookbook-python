@@ -1,18 +1,19 @@
 VENV_DIR := .venv
-PYTHON := $(VENV_DIR)/bin/python
+# The interpreter you select: it builds the virtual environment, `make doctor` checks it and
+# `make install-ci` installs into it.
+PYTHON ?= python3
 PIP := $(VENV_DIR)/bin/pip
 HATCH := $(VENV_DIR)/bin/hatch
 
+# POSIX sh helper: a tool counts only if `command -v` resolves it to an executable regular file.
+# dash's `command -v ./path` accepts any existing path, and `-x` alone is also true for a directory.
+HAVE := have() { p="$$(command -v "$$1")"; [ -f "$$p" ] && [ -x "$$p" ]; };
+
+# Idempotent: creates .venv and installs Hatch only while they are missing; never upgrades pip.
 .PHONY: bootstrap
 bootstrap:
-	@if [ ! -d "$(VENV_DIR)" ]; then \
-		echo "Creating virtual environment..."; \
-		python3 -m venv $(VENV_DIR); \
-	fi
-	@echo "Ensuring Hatch is installed in virtual environment..."
-	@$(PIP) install --upgrade pip > /dev/null
-	@$(PIP) install hatch > /dev/null
-	@echo "Hatch installed at $(HATCH)"
+	@test -d "$(VENV_DIR)" || { echo "Creating virtual environment..."; $(PYTHON) -m venv "$(VENV_DIR)"; }
+	@$(HAVE) have "$(HATCH)" || { echo "Installing Hatch..."; "$(PIP)" install --disable-pip-version-check --quiet hatch; }
 
 .PHONY: ensure-hatch
 ensure-hatch: bootstrap
@@ -25,6 +26,11 @@ install: ensure-hatch
 	else \
 		$(MAKE) precommit-install; \
 	fi
+
+# Installs into the selected interpreter (PYTHON), never into Hatch's default environment.
+.PHONY: install-ci
+install-ci:
+	@$(PYTHON) -m pip install -e ".[dev]"
 
 .PHONY: shell
 shell: ensure-hatch
@@ -95,11 +101,9 @@ recipe-tests: ensure-hatch
 docs-strict: ensure-hatch
 	@$(HATCH) run mkdocs build --strict
 
+# `lint` already runs the type check (hatch script `lint` = style + typecheck), so mypy runs once.
 .PHONY: check
-check: ensure-hatch
-	@$(MAKE) lint
-	@$(MAKE) lint-workflows
-	@$(MAKE) typecheck
+check: lint lint-workflows
 	@echo "Lint and type check passed."
 
 .PHONY: check-all
@@ -121,6 +125,37 @@ precommit-install: ensure-hatch
 test: ensure-hatch
 	@echo "Running tests..."
 	@$(HATCH) run test
+
+# Full local verification. A required lane fails on a skipped or xfailed test
+# (tools/pytest_fail_on_skip.py) and pytest exits 5 when a lane selects nothing. PYTEST_ADDOPTS is
+# set, not appended to, so a stray value in the caller's environment cannot deselect tests.
+FAIL_ON_SKIP := -p tools.pytest_fail_on_skip
+
+# Emulator lanes: the e2e fixtures start Azurite and `func start` themselves (tests/e2e/conftest.py).
+.PHONY: integration
+integration: ensure-hatch
+	@$(HAVE) missing=""; for tool in func azurite; do have "$$tool" || missing="$$missing $$tool"; done; \
+	[ -z "$$missing" ] || { echo "integration: missing required tool(s):$$missing (see make doctor)"; exit 2; }
+	@PYTEST_ADDOPTS="$(FAIL_ON_SKIP)" $(HATCH) run smoke
+	@PYTEST_ADDOPTS="$(FAIL_ON_SKIP)" $(HATCH) run e2e
+
+.PHONY: bicep
+bicep: ensure-hatch
+	@$(HATCH) run python tools/compile_bicep_templates.py
+
+# Needs network (it clones the pinned worker) and the worker's runtime requirements, which live in
+# the `worker` Hatch environment (pyproject.toml) rather than in the recipes' dev extras.
+.PHONY: worker-registration
+worker-registration: ensure-hatch
+	@PYTEST_ADDOPTS="$(FAIL_ON_SKIP)" $(HATCH) run worker:registration
+
+# Each part runs once and the first failure stops the run. Serial even under `make -j`: the lanes
+# share Azurite's fixed ports and the Hatch environments. `check-all` is the narrower everyday gate
+# and keeps its meaning.
+.NOTPARALLEL: verify
+.PHONY: verify
+verify: check test recipe-tests bicep worker-registration integration build docs-strict
+	@echo "Full local verification passed."
 
 .PHONY: new-recipe
 new-recipe: ensure-hatch
@@ -185,7 +220,18 @@ help:
 	@echo "Available commands:" && \
 	grep -E '^\.PHONY: ' Makefile | cut -d ':' -f2 | xargs -n1 echo "  - make"
 
+# What `make verify` needs, checked read-only: no prerequisites, so it never installs anything,
+# creates .venv or runs a test. (The product CLI is `azure-functions-doctor`, not this target.)
+# Bicep is looked up the way tools/compile_bicep_templates.py does: BICEP_CLI, else PATH.
 .PHONY: doctor
-doctor: ensure-hatch
-	@echo "Checking project health..."
-	@$(MAKE) check-all && echo "All checks passed." || { echo "Some checks failed."; exit 1; }
+doctor:
+	@missing=0; $(HAVE) \
+	if "$(PYTHON)" -c 'import sys; sys.exit(sys.version_info < (3, 11))' > /dev/null 2>&1; then \
+		echo "ok       $(PYTHON) (python >= 3.11)"; \
+	else echo "MISSING  python >= 3.11 ($(PYTHON) is missing or older; select one with PYTHON=python3.11)"; missing=1; fi; \
+	for tool in "$(HATCH)" uv git func azurite "$${BICEP_CLI:-bicep}"; do \
+		if have "$$tool"; then echo "ok       $$tool"; \
+		else echo "MISSING  $$tool"; missing=1; fi; \
+	done; \
+	[ $$missing -eq 0 ] || { echo "doctor: INCOMPLETE - make verify needs the MISSING tools above (Hatch: run make install)"; exit 1; }; \
+	echo "doctor: ok"
